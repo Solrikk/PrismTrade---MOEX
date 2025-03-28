@@ -55,43 +55,11 @@ class StockPredictor:
             print(f"Ошибка при поиске тикера: {e}")
             return False
 
-    def get_portfolio_info(self):
-        try:
-            with Client(self.token) as client:
-                accounts = client.users.get_accounts()
-                total_value = 0
-                margin_info = ""
-
-                for account in accounts.accounts:
-                    try:
-                        portfolio = client.operations.get_portfolio(
-                            account_id=account.id)
-                        for position in portfolio.positions:
-                            if position.figi == self.figi:
-                                quantity = float(position.quantity.units)
-                                if position.quantity.nano:
-                                    quantity += float(
-                                        position.quantity.nano) / 1e9
-                                value = quantity * position.current_price.units
-                                total_value += value
-
-                                if account.access_level.name == "ACCOUNT_ACCESS_LEVEL_FULL_ACCESS":
-                                    margin_info = f"\nМаржинальный счет: {'Да' if account.type.name == 'ACCOUNT_TYPE_MARGIN' else 'Нет'}"
-
-                    except Exception as e:
-                        continue
-
-                return total_value, margin_info
-
-        except Exception as e:
-            print(f"Ошибка при получении информации о портфеле: {e}")
-            return 0, ""
-
     def get_recommendation(self, rsi, macd, signal, price_change, momentum,
                            current_price):
         score = 0
         reasons = []
-
+        
         has_market_state = hasattr(self, 'last_market_state')
         market_state = getattr(self, 'last_market_state', {})
 
@@ -337,20 +305,6 @@ class StockPredictor:
             score -= trend_score_adjustment
             reasons.append(f"Корректировка на силу медвежьего тренда: -{trend_score_adjustment:.2f}")
 
-        if is_correction:
-            correction_depth_norm = min(1.0, market_state.get('correction_depth', 0) / 10)
-            reasons.append(f"Нормализованная глубина коррекции: {correction_depth_norm:.2f}")
-
-            if is_bullish and score < 0:
-                adjustment = min(abs(score) * 0.7, abs(score) * correction_depth_norm)
-                score += adjustment
-                reasons.append(f"Нейтрализация противоречивых сигналов в бычьей коррекции: +{adjustment:.2f}")
-            elif is_bearish and score > 0:
-                adjustment = min(score * 0.7, score * correction_depth_norm)
-                score -= adjustment
-                reasons.append(f"Нейтрализация противоречивых сигналов в медвежьей коррекции: -{adjustment:.2f}")
-
-
         if score >= 3:
             return "ПОКУПАТЬ (ЛОНГ) - Сильный сигнал", reasons, entry_exit_prices
         elif score > 0:
@@ -502,9 +456,7 @@ class StockPredictor:
             "stop_loss_buy": stop_loss_buy,
             "entry_price_sell": entry_price_sell,
             "exit_price_sell": exit_price_sell,
-            "stop_loss_sell": stop_loss_sell,
-            "target_pct": target_price_change_pct_buy,
-            "holding_period": holding_period
+            "stop_loss_sell": stop_loss_sell
         }
 
     def calculate_volatility(self, prices):
@@ -531,7 +483,7 @@ class StockPredictor:
         combined_momentum = (short_momentum * 0.7) + (long_momentum * 0.3)
 
         return combined_momentum
-
+    
     def collect_data(self, hours=24):
         print("Получение данных из Тинькофф...")
         moscow_tz = pytz.timezone('Europe/Moscow')
@@ -670,6 +622,8 @@ class StockPredictor:
 
         df['volume_sma'] = df['volume'].rolling(window=5).mean()
         df['volume_sma_long'] = df['volume'].rolling(window=20).mean()
+        
+        df['volume_change'] = df['volume'].pct_change() * 100
 
         df['volume_oscillator'] = (df['volume_sma'] / df['volume_sma_long'] -
                                    1) * 100
@@ -735,7 +689,14 @@ class StockPredictor:
             'retail_buying': False,
             'retail_selling': False,
             'trend_strength': 0,
-            'explanation': []
+            'explanation': [],
+            'false_breakout': False,
+            'false_breakdown': False,
+            'potential_reversal': False,
+            'whipsaw': False,
+            'volatile_consolidation': False,
+            'rapid_reversal_risk': 0,
+            'false_signal_probability': 0
         }
 
         if len(df) < 20:
@@ -788,46 +749,8 @@ class StockPredictor:
                 market_state['trend_strength'] = min(100,
                                                      int(40 - ma5_slope * 3))
 
-        if len(df) >= 20:
-            window_size = 10
-
-            recent_prices = df['close'].iloc[-window_size:].values
-
-            if long_term_trend == "bullish":
-                local_max = np.max(recent_prices)
-                current_price = recent_prices[-1]
-
-                correction_depth = (local_max -
-                                    current_price) / local_max * 100
-
-                if correction_depth > 1.0 and correction_depth < 10.0:
-                    market_state['correction'] = True
-                    market_state['correction_depth'] = correction_depth
-                    market_state['explanation'].append(
-                        f"Коррекция в бычьем тренде: глубина {correction_depth:.2f}%"
-                    )
-
-                    if 3.0 < correction_depth < 7.0:
-                        market_state['pullback_opportunity'] = True
-                        market_state['explanation'].append(
-                            "Потенциальная возможность покупки на откате")
-
-            elif long_term_trend == "bearish":
-                local_min = np.min(recent_prices)
-                current_price = recent_prices[-1]
-
-                bounce_height = (current_price - local_min) / local_min * 100
-
-                if bounce_height > 1.0 and bounce_height < 10.0:
-                    market_state['correction'] = True
-                    market_state['correction_depth'] = bounce_height
-                    market_state['explanation'].append(
-                        f"Коррекция в медвежьем тренде: высота {bounce_height:.2f}%"
-                    )
-
-                    if 3.0 < bounce_height < 7.0:
-                        market_state['explanation'].append(
-                            "Потенциальная возможность продажи на отскоке")
+        market_state['correction'] = False
+        market_state['correction_depth'] = 0
 
         if 'rsi' in df.columns:
             last_rsi = df['rsi'].iloc[-1]
@@ -861,15 +784,73 @@ class StockPredictor:
             macd_max_idx = np.argmax(recent_macd)
             macd_min_idx = np.argmin(recent_macd)
 
-            if price_max_idx != macd_max_idx and abs(price_max_idx -
-                                                     macd_max_idx) > 2:
+            if price_max_idx > macd_max_idx and abs(price_max_idx - macd_max_idx) > 2:
                 market_state['explanation'].append(
-                    "Обнаружена дивергенция между ценой и MACD (максимумы)")
+                    "Обнаружена медвежья дивергенция: цена растет, MACD падает (сигнал к возможному развороту вниз)")
+                
+                if recent_prices[price_max_idx] > recent_prices[macd_max_idx] * 1.02:
+                    market_state['potential_reversal'] = True
+                    market_state['explanation'].append(
+                        "Существенная медвежья дивергенция: возможно скорое окончание восходящего тренда")
+                    market_state['rapid_reversal_risk'] = min(100, market_state.get('rapid_reversal_risk', 0) + 40)
+                    
+                    if market_state.get('overbought', False):
+                        market_state['false_breakout'] = True
+                        market_state['explanation'].append(
+                            "Перекупленность + медвежья дивергенция: высокая вероятность ложного движения вверх")
 
-            if price_min_idx != macd_min_idx and abs(price_min_idx -
-                                                     macd_min_idx) > 2:
+            if price_min_idx > macd_min_idx and abs(price_min_idx - macd_min_idx) > 2:
                 market_state['explanation'].append(
-                    "Обнаружена дивергенция между ценой и MACD (минимумы)")
+                    "Обнаружена бычья дивергенция: цена падает, MACD растет (сигнал к возможному развороту вверх)")
+                
+                if recent_prices[price_min_idx] < recent_prices[macd_min_idx] * 0.98:
+                    market_state['potential_reversal'] = True
+                    market_state['explanation'].append(
+                        "Существенная бычья дивергенция: возможно скорое окончание нисходящего тренда")
+                    market_state['rapid_reversal_risk'] = min(100, market_state.get('rapid_reversal_risk', 0) + 40)
+                    
+                    if market_state.get('oversold', False):
+                        market_state['false_breakdown'] = True
+                        market_state['explanation'].append(
+                            "Перепроданность + бычья дивергенция: высокая вероятность ложного движения вниз")
+            
+            if len(recent_macd) >= 5:
+                macd_slope_early = recent_macd[1] - recent_macd[0]
+                macd_slope_late = recent_macd[-1] - recent_macd[-2]
+                
+                if macd_slope_early > 0 and macd_slope_late > 0 and macd_slope_late < macd_slope_early * 0.5:
+                    market_state['explanation'].append(
+                        "Замедление роста MACD: возможное ослабление восходящего импульса")
+                    
+                    if market_state.get('bullish', False):
+                        market_state['false_signal_probability'] = min(75, market_state.get('false_signal_probability', 0) + 30)
+                
+                if macd_slope_early < 0 and macd_slope_late < 0 and abs(macd_slope_late) < abs(macd_slope_early) * 0.5:
+                    market_state['explanation'].append(
+                        "Замедление падения MACD: возможное ослабление нисходящего импульса")
+                    
+                    if market_state.get('bearish', False):
+                        market_state['false_signal_probability'] = min(75, market_state.get('false_signal_probability', 0) + 30)
+                        
+            if 'signal' in df.columns and len(df) > 20:
+                recent_signal = df['signal'].iloc[-10:].values
+                
+                signal_max_idx = np.argmax(recent_signal)
+                signal_min_idx = np.argmin(recent_signal)
+                
+                if (price_max_idx > macd_max_idx and price_max_idx > signal_max_idx and 
+                    abs(price_max_idx - signal_max_idx) > 3):
+                    market_state['explanation'].append(
+                        "Подтвержденная медвежья дивергенция (цена, MACD, сигнальная линия): высокая вероятность разворота вниз")
+                    market_state['potential_reversal'] = True
+                    market_state['rapid_reversal_risk'] = min(100, market_state.get('rapid_reversal_risk', 0) + 60)
+                
+                if (price_min_idx > macd_min_idx and price_min_idx > signal_min_idx and 
+                    abs(price_min_idx - signal_min_idx) > 3):
+                    market_state['explanation'].append(
+                        "Подтвержденная бычья дивергенция (цена, MACD, сигнальная линия): высокая вероятность разворота вверх")
+                    market_state['potential_reversal'] = True
+                    market_state['rapid_reversal_risk'] = min(100, market_state.get('rapid_reversal_risk', 0) + 60)
 
         if 'volume' in df.columns and 'volume_sma' in df.columns and len(
                 df) > 20:
@@ -889,6 +870,39 @@ class StockPredictor:
                                          recent_df['volume_sma']]
             if not high_volume_bars.empty:
                 price_direction = high_volume_bars['close'].diff().sum()
+
+                if len(high_volume_bars) >= 2:
+                    first_bars = high_volume_bars.iloc[:len(high_volume_bars)//2]
+                    last_bars = high_volume_bars.iloc[len(high_volume_bars)//2:]
+                    
+                    first_direction = first_bars['close'].diff().sum()
+                    last_direction = last_bars['close'].diff().sum()
+                    
+                    if (first_direction > 0 and last_direction < 0 and abs(last_direction) > abs(first_direction) * 0.7):
+                        market_state['false_breakout'] = True
+                        market_state['explanation'].append(
+                            "Обнаружен ложный пробой вверх: рост и резкий разворот вниз на высоком объеме"
+                        )
+                        market_state['false_signal_probability'] = min(85, 50 + (abs(last_direction/first_direction) * 30))
+                        market_state['rapid_reversal_risk'] = 75
+                        
+                    elif (first_direction < 0 and last_direction > 0 and abs(last_direction) > abs(first_direction) * 0.7):
+                        market_state['false_breakdown'] = True
+                        market_state['explanation'].append(
+                            "Обнаружен ложный пробой вниз: падение и резкий разворот вверх на высоком объеме"
+                        )
+                        market_state['false_signal_probability'] = min(85, 50 + (abs(last_direction/first_direction) * 30))
+                        market_state['rapid_reversal_risk'] = 75
+                    
+                    if len(high_volume_bars) >= 3:
+                        directions = np.sign(high_volume_bars['close'].diff().dropna().values)
+                        direction_changes = np.diff(directions, prepend=directions[0])
+                        if np.count_nonzero(direction_changes) >= len(directions) * 0.6:
+                            market_state['whipsaw'] = True
+                            market_state['explanation'].append(
+                                "Рынок в состоянии 'пилы': резкие разнонаправленные движения"
+                            )
+                            market_state['volatile_consolidation'] = True
 
                 if price_direction > 0:
                     market_state['smart_money_buying'] = True
@@ -941,6 +955,7 @@ class StockPredictor:
 
         return market_state
 
+    
     def predict_multiple_intervals(self, times, prices, volumes):
         if len(prices) < 20:
             return None, None, None, None, None
@@ -962,7 +977,7 @@ class StockPredictor:
         feature_columns = [
             'rsi', 'macd', 'signal', 'volume', 'volume_sma', 'price_ma_5',
             'price_ma_20', 'volatility', 'upper_band', 'lower_band',
-            'volume_change', 'price_diff'
+            'price_diff'
         ]
 
         available_features = [
@@ -1197,18 +1212,10 @@ class StockPredictor:
             trend_text = f"⬆️ БЫЧИЙ ТРЕНД (сила: {trend_strength}%)"
             info_text.append(trend_text)
 
-            if is_correction:
-                correction_depth = market_state.get('correction_depth', 0)
-                info_text.append(
-                    f"📉 Коррекция в бычьем тренде: {correction_depth:.2f}%")
         elif is_bearish:
             trend_text = f"⬇️ МЕДВЕЖИЙ ТРЕНД (сила: {trend_strength}%)"
             info_text.append(trend_text)
 
-            if is_correction:
-                correction_depth = market_state.get('correction_depth', 0)
-                info_text.append(
-                    f"📈 Коррекция в медвежьем тренде: {correction_depth:.2f}%")
         else:
             info_text.append("↔️ БОКОВОЙ ТРЕНД")
 
@@ -1227,32 +1234,6 @@ class StockPredictor:
                          bbox=dict(boxstyle="round,pad=0.2",
                                    facecolor='white',
                                    alpha=0.8))
-
-        if is_bullish and len(prices) > 0:
-            last_price = prices[-1]
-            correction_zones = [
-                last_price * (1 - 0.03), last_price * (1 - 0.05),
-                last_price * (1 - 0.08)
-            ]
-
-            correction_labels = [
-                "3% коррекция", "5% коррекция", "8% коррекция"
-            ]
-            correction_colors = ["#F3D250", "#F78888", "#FF6B6B"]
-
-            for i, (zone, label, color) in enumerate(
-                    zip(correction_zones, correction_labels,
-                        correction_colors)):
-                plt.axhline(y=zone, color=color, linestyle='--', alpha=0.4)
-                plt.annotate(label,
-                             xy=(times[-1], zone),
-                             xytext=(10, 0),
-                             textcoords='offset points',
-                             fontsize=8,
-                             color=color,
-                             bbox=dict(boxstyle="round,pad=0.1",
-                                       facecolor='white',
-                                       alpha=0.6))
 
         plt.title(
             f'Прогноз цены акции {self.ticker} с анализом трендов и коррекций',
@@ -1331,6 +1312,8 @@ async def analyze(ticker: str = Form(...)):
     if not predictor.set_ticker(ticker):
         return JSONResponse({"error": f"Тикер {ticker} не найден"})
 
+    print(f"Анализ акции {ticker}...")
+    
     times, prices, volumes = predictor.collect_data()
 
     if not prices or len(prices) < 20:
@@ -1348,8 +1331,6 @@ async def analyze(ticker: str = Form(...)):
     last_rsi = df['rsi'].iloc[-1]
     last_macd = df['macd'].iloc[-1]
     last_signal = df['signal'].iloc[-1]
-
-    portfolio_value, margin_info = predictor.get_portfolio_info()
 
     recommendation, reasons, entry_exit_prices = predictor.get_recommendation(
         last_rsi, last_macd, last_signal, price_change, momentum, prices[-1])
@@ -1373,7 +1354,7 @@ async def analyze(ticker: str = Form(...)):
         'correction_depth': market_state.get('correction_depth', 0),
         'explanation': market_state.get('explanation', [])
     }
-
+    
     result = {
         'ticker': ticker,
         'current_price': prices[-1],
@@ -1386,8 +1367,6 @@ async def analyze(ticker: str = Form(...)):
         'rsi': last_rsi,
         'macd': last_macd,
         'signal_line': last_signal,
-        'portfolio_value': portfolio_value,
-        'margin_info': margin_info.replace('\n', '') if margin_info else '',
         'recommendation': recommendation,
         'reasons': reasons,
         'entry_exit_prices': entry_exit_prices,
@@ -1472,9 +1451,15 @@ from prediction_analytics import PredictionAnalytics
 
 @app.get("/prediction_accuracy/{ticker}")
 async def prediction_accuracy(ticker: str):
-    """Получение данных о точности прогнозов"""
     analytics = PredictionAnalytics()
-    accuracy_data = analytics.calculate_advanced_metrics(ticker)
+    
+    try:
+        accuracy_data = analytics.evaluate_prediction_quality(ticker)
+        if isinstance(accuracy_data, dict) and "error" in accuracy_data:
+            accuracy_data = analytics.calculate_advanced_metrics(ticker)
+    except Exception as e:
+        print(f"Ошибка при использовании нового метода оценки: {e}")
+        accuracy_data = analytics.calculate_advanced_metrics(ticker)
 
     if not accuracy_data:
         return JSONResponse(
@@ -1484,7 +1469,6 @@ async def prediction_accuracy(ticker: str):
 
 @app.get("/advanced_analytics/{ticker}")
 async def advanced_analytics(ticker: str):
-    """Получение расширенной аналитики и результатов кросс-валидации"""
     predictor = StockPredictor()
     if not predictor.set_ticker(ticker):
         return JSONResponse({"error": f"Тикер {ticker} не найден"})
@@ -1543,7 +1527,6 @@ def save_prediction_history(ticker, current_price, predictions):
 
 
 def analyze_prediction_accuracy(ticker):
-    """Анализирует точность предыдущих прогнозов"""
     ticker_dir = os.path.join(PREDICTION_HISTORY_DIR, ticker)
 
     if not os.path.exists(ticker_dir):
@@ -1635,33 +1618,86 @@ def calculate_recommendation_confidence(reasons, market_state,
     bearish_indicators = sum(1 for reason in reasons if "сильный сигнал к продаже" in reason or "умеренный сигнал к продаже" in reason or "возможность для продажи" in reason or "медвежий тренд" in reason)
     neutral_indicators = len(reasons) - bullish_indicators - bearish_indicators
 
+    contradictory_signals = False
+    if bullish_indicators >= 2 and bearish_indicators >= 2:
+        contradictory_signals = True
+        
+    potential_fakeout = False
+    if (volatility > 1.5 and abs(price_change) > 2.0):
+        potential_fakeout = True
+    
+    rapid_reversal_chance = 0
+    
+    trend_stability = 0.8
+    if 'smart_money_buying' in market_state and market_state['smart_money_buying']:
+        trend_stability = 0.9
+    if 'smart_money_selling' in market_state and market_state['smart_money_selling']:
+        trend_stability = 0.9
+        
     if market_state['bullish']:
         bullish_weight = 0.6 + market_state['trend_strength'] / 200
         bearish_weight = 0.4 - market_state['trend_strength'] / 300
+        
+        if potential_fakeout:
+            bullish_weight *= trend_stability
+            bearish_weight *= (2 - trend_stability)
     elif market_state['bearish']:
         bullish_weight = 0.4 - market_state['trend_strength'] / 300
         bearish_weight = 0.6 + market_state['trend_strength'] / 200
+        
+        if potential_fakeout:
+            bearish_weight *= trend_stability
+            bullish_weight *= (2 - trend_stability)
     else:
         bullish_weight = 0.5
         bearish_weight = 0.5
 
+    if contradictory_signals:
+        bullish_weight *= 0.7
+        bearish_weight *= 0.7
+        neutral_weight = 0.4
+    else:
+        neutral_weight = 0.25
+
     volatility_factor = 1.0
     if volatility > 2.0:
+        volatility_factor = 0.7
+    elif volatility > 1.5:
         volatility_factor = 0.8
     elif volatility < 0.5:
         volatility_factor = 1.2
 
     price_change_factor = 1.0
     if price_change > 2:
-        price_change_factor = 1.1
+        price_change_factor = 1.1 * trend_stability
     elif price_change < -2:
-        price_change_factor = 0.9
-
+        price_change_factor = 0.9 * trend_stability
+        
+    market_phase_factor = 1.0
+    if market_state.get('oversold', False):
+        market_phase_factor = 1.2 
+    elif market_state.get('overbought', False):
+        market_phase_factor = 1.2 
+            
+    if (market_state.get('overbought', False) and price_change < 0) or \
+       (market_state.get('oversold', False) and price_change > 0):
+        rapid_reversal_chance = 0.3
+        
     confidence = (
-        bullish_weight * bullish_indicators +
-        bearish_weight * bearish_indicators + neutral_indicators / 4) * \
-    volatility_factor * price_change_factor
-
+        (bullish_weight * bullish_indicators +
+        bearish_weight * bearish_indicators + 
+        neutral_weight * neutral_indicators) * 
+        volatility_factor * price_change_factor * market_phase_factor
+    )
+    
+    if rapid_reversal_chance > 0:
+        confidence *= (1 - rapid_reversal_chance)
+        
+    if contradictory_signals:
+        confidence *= 0.85
+        
+    if potential_fakeout:
+        confidence *= 0.8
 
     return min(100, max(0, int(confidence * 10)))
 
