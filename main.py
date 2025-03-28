@@ -91,7 +91,6 @@ class StockPredictor:
                            current_price):
         score = 0
         reasons = []
-        commission = 15
 
         has_market_state = hasattr(self, 'last_market_state')
         market_state = getattr(self, 'last_market_state', {})
@@ -325,7 +324,7 @@ class StockPredictor:
                     f"Очень сильный медвежий тренд (сила: {trend_strength}%)")
 
         entry_exit_prices = self.calculate_entry_exit_prices(
-            current_price, commission, volatility=price_change)
+            current_price, volatility=price_change)
 
         context_coefficient = trend_strength / 100
 
@@ -361,8 +360,7 @@ class StockPredictor:
         else:
             return "ПРОДАВАТЬ (ШОРТ) - Сильный сигнал", reasons, entry_exit_prices
 
-    def calculate_entry_exit_prices(self, current_price, commission,
-                                    volatility):
+    def calculate_entry_exit_prices(self, current_price, volatility):
         has_market_state = hasattr(self, 'last_market_state')
         market_state = getattr(self, 'last_market_state', {})
 
@@ -414,10 +412,8 @@ class StockPredictor:
             volatility_coefficient_sell = volatility_coefficient_sell + (
                 trend_strength / 100 * 0.5)
 
-        commission_pct = (commission / current_price) * 100
-
-        min_price_change_pct_buy = commission_pct + min_profit_pct_buy
-        min_price_change_pct_sell = commission_pct + min_profit_pct_sell
+        min_price_change_pct_buy = min_profit_pct_buy
+        min_price_change_pct_sell = min_profit_pct_sell
 
         if hasattr(self, 'last_volatility'):
             real_volatility = self.last_volatility
@@ -507,8 +503,6 @@ class StockPredictor:
             "entry_price_sell": entry_price_sell,
             "exit_price_sell": exit_price_sell,
             "stop_loss_sell": stop_loss_sell,
-            "commission": commission,
-            "commission_pct": commission_pct,
             "target_pct": target_price_change_pct_buy,
             "holding_period": holding_period
         }
