@@ -123,7 +123,7 @@ MIT License
 
 ## Автор
 
-Ваше имя - [Ваш email](mailto:your.email@example.com)
+Ваше имя - [Solrikk](mailto:reveni324@gmail.com)
 
 ## Благодарности
 
