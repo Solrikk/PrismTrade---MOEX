@@ -81,9 +81,6 @@ python main.py
 
 ## Примеры работы
 
-### Прогноз и анализ рынка
-![Прогноз и анализ рынка](static/stock_prediction.png)
-
 ### Метаобучение
 ![Метаобучение](https://github.com/Solrikk/PrismTrade---MOEX/blob/main/static/analytics/SBER_meta_learning_corrections.png)
 
