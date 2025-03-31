@@ -608,6 +608,193 @@ class PredictionAnalytics:
         plt.savefig(chart_path, dpi=200)
         plt.close()
 
+    def optimize_ensemble_weights(self, ticker, models, historical_prices, window_size=10):
+        """Оптимизирует веса ансамблевой модели на основе исторических данных"""
+        if len(historical_prices) < window_size * 2:
+            # Недостаточно данных для оптимизации, возвращаем стандартные веса
+            return {'lstm': 0.6, 'arima': 0.4}
+        
+        # Получаем историю прогнозов для оценки точности моделей
+        prediction_history = self.load_predictions(ticker)
+        if len(prediction_history) < 5:
+            # Недостаточно предыдущих прогнозов, используем стандартные веса
+            return {'lstm': 0.6, 'arima': 0.4}
+        
+        # Оцениваем точность каждой модели на основе исторических данных
+        model_errors = {}
+        for model_name in models:
+            model_errors[model_name] = []
+        
+        for interval in ['15', '30', '60']:
+            prediction_actual_pairs = self.get_prediction_actual_pairs(prediction_history, interval)
+            if len(prediction_actual_pairs) < 3:
+                continue
+            
+            for pair in prediction_actual_pairs:
+                # Ищем оригинальный прогноз для этой точки
+                for pred in prediction_history:
+                    if pred['timestamp'] == pair['timestamp'] and 'predictions' in pred:
+                        if interval in pred['predictions']:
+                            # Извлекаем информацию о моделях, если она есть
+                            pred_details = pred['predictions'].get(interval, {})
+                            if 'models_used' in pred_details and 'weights' in pred_details:
+                                for model in pred_details.get('models_used', []):
+                                    if model in models and model in pred_details.get('weights', {}):
+                                        # Добавляем ошибку модели для дальнейшего анализа
+                                        error = abs(pair['predicted'] - pair['actual']) / pair['actual']
+                                        model_errors[model].append(error)
+        
+        # Если есть данные об ошибках для обеих моделей
+        if all(len(errors) > 0 for errors in model_errors.values()):
+            # Вычисляем средние ошибки для каждой модели
+            avg_errors = {model: np.mean(errors) for model, errors in model_errors.items()}
+            total_error = sum(avg_errors.values())
+            
+            if total_error > 0:
+                # Рассчитываем веса обратно пропорционально ошибкам
+                # Модель с меньшей ошибкой должна иметь больший вес
+                raw_weights = {model: 1/(error+0.001) for model, error in avg_errors.items()}
+                total_raw_weight = sum(raw_weights.values())
+                optimal_weights = {model: weight/total_raw_weight for model, weight in raw_weights.items()}
+                
+                # Добавляем немного стабильности - не позволяем весам быть слишком экстремальными
+                for model in optimal_weights:
+                    if optimal_weights[model] > 0.9:
+                        optimal_weights[model] = 0.9
+                    elif optimal_weights[model] < 0.1:
+                        optimal_weights[model] = 0.1
+                
+                # Нормализуем веса заново
+                total_weight = sum(optimal_weights.values())
+                for model in optimal_weights:
+                    optimal_weights[model] /= total_weight
+                
+                return optimal_weights
+        
+        # Используем динамическое взвешивание на основе текущей волатильности рынка
+        return self.calculate_adaptive_weights(historical_prices, models)
+    
+    def calculate_adaptive_weights(self, historical_prices, models):
+        """Рассчитывает адаптивные веса на основе текущей волатильности и рыночных условий"""
+        # Проверяем наличие моделей
+        if len(models) == 0:
+            return {}
+        if len(models) == 1:
+            return {models[0]: 1.0}
+        
+        # Рассчитываем текущую волатильность
+        if len(historical_prices) < 20:
+            # Недостаточно данных, используем стандартные веса
+            return {'lstm': 0.6, 'arima': 0.4}
+        
+        returns = pd.Series(historical_prices).pct_change().dropna()
+        volatility = returns.std() * np.sqrt(252)  # Годовая волатильность
+        
+        # Анализируем тренд
+        window = min(20, len(historical_prices) // 3)
+        trend_strength = abs((historical_prices[-1] / historical_prices[-window]) - 1) * 100
+        
+        # Адаптивное взвешивание для разных рыночных условий
+        weights = {}
+        
+        # LSTM обычно лучше работает при выраженных трендах и высокой волатильности
+        if 'lstm' in models:
+            if volatility > 0.02:  # Высокая волатильность
+                weights['lstm'] = 0.7 + min(0.2, volatility * 5)
+            elif trend_strength > 3:  # Сильный тренд
+                weights['lstm'] = 0.65 + min(0.15, trend_strength / 20)
+            else:  # Стабильный рынок
+                weights['lstm'] = 0.55
+        
+        # ARIMA обычно лучше при низкой волатильности и стабильных условиях
+        if 'arima' in models:
+            if volatility < 0.01:  # Низкая волатильность
+                weights['arima'] = 0.6 + min(0.2, (0.02 - volatility) * 10)
+            elif trend_strength < 1:  # Слабый тренд
+                weights['arima'] = 0.55 + min(0.15, 1 / (trend_strength + 0.1))
+            else:  # Другие условия
+                weights['arima'] = 0.45
+        
+        # Проверка на другие модели
+        for model in models:
+            if model not in weights:
+                weights[model] = 0.5
+        
+        # Нормализуем веса
+        total_weight = sum(weights.values())
+        for model in weights:
+            weights[model] /= total_weight
+        
+        return weights
+
+    def perform_cross_validation_for_weights(self, ticker, models, historical_prices, window_size=10):
+        """Выполняет кросс-валидацию для поиска оптимальных весов ансамбля"""
+        if len(historical_prices) < window_size * 3:
+            return self.calculate_adaptive_weights(historical_prices, models)
+        
+        # Инициализируем массив возможных весовых комбинаций
+        weight_options = []
+        step = 0.1
+        for w1 in np.arange(0.1, 1.0, step):
+            w2 = 1.0 - w1
+            weight_options.append((w1, w2))
+        
+        errors = []
+        for w1, w2 in weight_options:
+            total_error = 0
+            valid_windows = 0
+            
+            # Проводим кросс-валидацию на исторических окнах
+            for i in range(window_size, len(historical_prices) - window_size, window_size):
+                train_data = historical_prices[:i]
+                test_data = historical_prices[i:i+window_size]
+                
+                # Если есть данные о прогнозах моделей для этого окна
+                pred_window = None
+                for pred in self.load_predictions(ticker):
+                    if abs(len(train_data) - pd.Series(pred.get('predictions', {}).get('prices', [])).count()) < 5:
+                        pred_window = pred
+                        break
+                
+                if pred_window is None:
+                    continue
+                
+                # Взвешенный прогноз
+                model_preds = {}
+                for model in models:
+                    if model in pred_window.get('models', {}):
+                        model_preds[model] = pred_window['models'][model].get('predictions', [])
+                
+                if len(model_preds) < len(models):
+                    continue
+                
+                # Расчет ошибки для этого набора весов
+                ensemble_preds = []
+                model_list = list(models)
+                
+                for i in range(min(len(model_preds[model_list[0]]), len(test_data))):
+                    weighted_pred = model_preds[model_list[0]][i] * w1
+                    if len(model_list) > 1:
+                        weighted_pred += model_preds[model_list[1]][i] * w2
+                    ensemble_preds.append(weighted_pred)
+                
+                if len(ensemble_preds) > 0:
+                    error = np.mean([abs(ensemble_preds[i] - test_data[i]) / test_data[i] for i in range(len(ensemble_preds))])
+                    total_error += error
+                    valid_windows += 1
+            
+            if valid_windows > 0:
+                errors.append((w1, w2, total_error / valid_windows))
+        
+        if errors:
+            # Находим комбинацию весов с минимальной ошибкой
+            optimal = min(errors, key=lambda x: x[2])
+            if len(models) == 2:
+                return {models[0]: optimal[0], models[1]: optimal[1]}
+        
+        # Если не удалось выполнить кросс-валидацию, используем адаптивные веса
+        return self.calculate_adaptive_weights(historical_prices, models)
+
     def combine_advanced_models(self, ticker, historical_prices, features=None):
         results = {}
         lstm_results = self.build_lstm_model(ticker, historical_prices, features)
@@ -621,32 +808,77 @@ class PredictionAnalytics:
             models_available.append('arima')
         if not models_available:
             return {"error": "Не удалось создать ни одну из продвинутых моделей", "lstm_error": lstm_error, "arima_error": arima_error}
+        
+        # Определяем динамические веса для ансамбля
+        dynamic_weights = self.optimize_ensemble_weights(ticker, models_available, historical_prices)
+        
+        # Получаем альтернативные веса через кросс-валидацию
+        cv_weights = self.perform_cross_validation_for_weights(ticker, models_available, historical_prices)
+        
+        # Комбинируем методы определения весов (с небольшим предпочтением к оптимизированным весам)
+        final_weights = {}
+        for model in models_available:
+            if model in dynamic_weights and model in cv_weights:
+                final_weights[model] = 0.7 * dynamic_weights[model] + 0.3 * cv_weights[model]
+            elif model in dynamic_weights:
+                final_weights[model] = dynamic_weights[model]
+            elif model in cv_weights:
+                final_weights[model] = cv_weights[model]
+            else:
+                # Стандартные веса, если все методы не сработали
+                if model == 'lstm':
+                    final_weights[model] = 0.6
+                elif model == 'arima':
+                    final_weights[model] = 0.4
+                else:
+                    final_weights[model] = 1.0 / len(models_available)
+        
+        # Нормализуем финальные веса
+        total_weight = sum(final_weights.values())
+        for model in final_weights:
+            final_weights[model] /= total_weight
+                    
         intervals = ['15', '30', '60']
         combined_predictions = {}
+        weight_explanations = []
+        
         for interval in intervals:
             preds = []
             weights = []
+            model_names = []
+            
             if 'lstm' in models_available and interval in lstm_results.get('predictions', {}):
                 lstm_pred = lstm_results['predictions'][interval]['price']
                 preds.append(lstm_pred)
-                weights.append(0.6)
+                weights.append(final_weights['lstm'])
+                model_names.append('lstm')
+                weight_explanations.append(f"LSTM вес: {final_weights['lstm']:.3f}")
+                
             if 'arima' in models_available and interval in arima_results.get('predictions', {}):
                 arima_pred = arima_results['predictions'][interval]['price']
                 preds.append(arima_pred)
-                weights.append(0.4)
+                weights.append(final_weights['arima'])
+                model_names.append('arima')
+                weight_explanations.append(f"ARIMA вес: {final_weights['arima']:.3f}")
+                
             if preds:
+                # Убедимся, что сумма весов = 1
                 weights = [w / sum(weights) for w in weights]
                 combined_price = sum(p * w for p, w in zip(preds, weights))
                 current_price = historical_prices[-1]
                 change_percent = ((combined_price - current_price) / current_price) * 100
+                
                 combined_predictions[interval] = {
                     'price': round(combined_price, 2),
                     'change': round(change_percent, 2),
-                    'model_type': 'Ensemble (LSTM + ARIMA)',
-                    'models_used': models_available,
-                    'weights': dict(zip(models_available, weights))
+                    'model_type': 'Динамический ансамбль',
+                    'models_used': model_names,
+                    'weights': dict(zip(model_names, [round(w, 3) for w in weights])),
+                    'weight_explanation': ' | '.join(weight_explanations)
                 }
-        chart_path = self.plot_model_comparison(ticker, historical_prices, lstm_results.get('predictions', {}), arima_results.get('predictions', {}), combined_predictions)
+                
+        chart_path = self.plot_model_comparison(ticker, historical_prices, lstm_results.get('predictions', {}), arima_results.get('predictions', {}), combined_predictions, final_weights)
+        
         return {
             'predictions': combined_predictions,
             'models_used': models_available,
@@ -654,10 +886,12 @@ class PredictionAnalytics:
                 'lstm': lstm_results.get('model_info') if 'lstm' in models_available else None,
                 'arima': arima_results.get('model_info') if 'arima' in models_available else None
             },
+            'ensemble_weights': final_weights,
+            'weight_method': 'Динамическая оптимизация весов ансамбля',
             'chart_path': chart_path
         }
 
-    def plot_model_comparison(self, ticker, historical_prices, lstm_predictions, arima_predictions, combined_predictions):
+    def plot_model_comparison(self, ticker, historical_prices, lstm_predictions, arima_predictions, combined_predictions, dynamic_weights=None):
         if not os.path.exists('static/analytics'):
             os.makedirs('static/analytics')
         plt.figure(figsize=(12, 8))
@@ -666,36 +900,91 @@ class PredictionAnalytics:
         current_price = historical_prices[-1]
         current_idx = hist_len - 1
         interval = '15'
+        
+        # Модель LSTM
         if interval in lstm_predictions:
             lstm_price = lstm_predictions[interval]['price']
             plt.scatter([current_idx + int(interval)], [lstm_price], color='#3498DB', s=100, marker='o', label='LSTM')
             plt.plot([current_idx, current_idx + int(interval)], [current_price, lstm_price], color='#3498DB', linestyle='--')
+            if dynamic_weights and 'lstm' in dynamic_weights:
+                plt.annotate(f"Вес: {dynamic_weights['lstm']:.2f}", 
+                            xy=(current_idx + int(interval), lstm_price), 
+                            xytext=(5, 10), 
+                            textcoords="offset points", 
+                            fontsize=8, 
+                            bbox=dict(boxstyle="round,pad=0.1", fc="#D6EAF8", alpha=0.7))
+        
+        # Модель ARIMA
         if interval in arima_predictions:
             arima_price = arima_predictions[interval]['price']
             plt.scatter([current_idx + int(interval)], [arima_price], color='#E74C3C', s=100, marker='s', label='ARIMA')
             plt.plot([current_idx, current_idx + int(interval)], [current_price, arima_price], color='#E74C3C', linestyle='--')
+            if dynamic_weights and 'arima' in dynamic_weights:
+                plt.annotate(f"Вес: {dynamic_weights['arima']:.2f}", 
+                            xy=(current_idx + int(interval), arima_price), 
+                            xytext=(5, -15), 
+                            textcoords="offset points", 
+                            fontsize=8, 
+                            bbox=dict(boxstyle="round,pad=0.1", fc="#FADBD8", alpha=0.7))
+        
+        # Ансамбль моделей
         if interval in combined_predictions:
             combined_price = combined_predictions[interval]['price']
-            plt.scatter([current_idx + int(interval)], [combined_price], color='#2ECC71', s=140, marker='*', label='Ансамбль моделей')
+            plt.scatter([current_idx + int(interval)], [combined_price], color='#2ECC71', s=140, marker='*', label='Динамический ансамбль')
             plt.plot([current_idx, current_idx + int(interval)], [current_price, combined_price], color='#2ECC71', linestyle='-', linewidth=2)
             change_pct = combined_predictions[interval]['change']
             change_text = f"+{change_pct:.2f}%" if change_pct >= 0 else f"{change_pct:.2f}%"
-            plt.annotate(f"Ансамбль: {combined_price:.2f} ({change_text})", xy=(current_idx + int(interval), combined_price), xytext=(10, 0), textcoords="offset points", fontsize=10, bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+            
+            # Добавляем информацию о весах, если доступно
+            weights_info = ""
+            if 'weight_explanation' in combined_predictions[interval]:
+                weights_info = f"\n{combined_predictions[interval]['weight_explanation']}"
+                
+            plt.annotate(f"Ансамбль: {combined_price:.2f} ({change_text}){weights_info}", 
+                        xy=(current_idx + int(interval), combined_price), 
+                        xytext=(10, 0), 
+                        textcoords="offset points", 
+                        fontsize=10, 
+                        bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+        
+        # Текущая цена
         plt.scatter([current_idx], [current_price], color='black', s=100, label='Текущая цена')
         plt.annotate(f"Текущая: {current_price:.2f}", xy=(current_idx, current_price), xytext=(10, -15), textcoords="offset points", fontsize=10, bbox=dict(boxstyle="round,pad=0.3", fc="white", alpha=0.8))
+        
+        # Добавляем другие интервалы
         for other_interval in ['30', '60']:
             plt.axvline(x=current_idx + int(other_interval), color='gray', linestyle=':', alpha=0.5)
             if other_interval in combined_predictions:
                 price = combined_predictions[other_interval]['price']
                 plt.scatter([current_idx + int(other_interval)], [price], color='#2ECC71', s=100, marker='*')
-                plt.annotate(f"{other_interval}м: {price:.2f}", xy=(current_idx + int(other_interval), price), xytext=(5, 5), textcoords="offset points", fontsize=9, bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
-        plt.title(f'Сравнение моделей прогнозирования для {ticker}', fontsize=14)
+                
+                # Добавляем более подробную информацию о весах для других интервалов
+                weights_text = ""
+                if 'weights' in combined_predictions[other_interval]:
+                    weights = combined_predictions[other_interval]['weights']
+                    weights_formatted = ", ".join([f"{k}={v:.2f}" for k, v in weights.items()])
+                    weights_text = f" [веса: {weights_formatted}]"
+                    
+                plt.annotate(f"{other_interval}м: {price:.2f}{weights_text}", 
+                            xy=(current_idx + int(other_interval), price), 
+                            xytext=(5, 5), 
+                            textcoords="offset points", 
+                            fontsize=9, 
+                            bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.7))
+        
+        # Добавляем информацию о методе определения весов
+        weights_method_text = "Динамическое взвешивание ансамбля на основе исторической точности и рыночных условий"
+        if dynamic_weights:
+            weights_values = [f"{k}: {v:.3f}" for k, v in dynamic_weights.items()]
+            weights_method_text += f"\nОптимальные веса: {', '.join(weights_values)}"
+        
+        plt.title(f'Сравнение моделей прогнозирования для {ticker} с динамическим взвешиванием', fontsize=14)
         plt.xlabel('Временные шаги (минуты)', fontsize=12)
         plt.ylabel('Цена', fontsize=12)
         plt.grid(True, alpha=0.3)
         plt.legend(loc='best')
-        plt.figtext(0.5, 0.01, "Сравнение различных моделей машинного обучения для прогнозирования цен", ha="center", fontsize=10, bbox={"facecolor":"#f0f0f0", "alpha":0.5, "pad":5})
-        plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+        plt.figtext(0.5, 0.01, weights_method_text, ha="center", fontsize=10, bbox={"facecolor":"#f0f0f0", "alpha":0.5, "pad":5})
+        plt.tight_layout(rect=[0, 0.08, 1, 0.95])
         chart_path = f'static/analytics/{ticker}_model_comparison.png'
         plt.savefig(chart_path, dpi=200)
         plt.close()
