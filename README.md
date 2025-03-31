@@ -85,7 +85,7 @@ python main.py
 ![Прогноз и анализ рынка](static/stock_prediction.png)
 
 ### Метаобучение
-![Метаобучение](static/analytics/SBER_meta_learning_corrections.png)
+![Метаобучение](https://github.com/Solrikk/PrismTrade---MOEX/blob/main/static/analytics/SBER_meta_learning_corrections.png)
 
 ### Ансамблевые модели
 ![Ансамблевые модели](static/analytics/SBER_model_comparison.png)
