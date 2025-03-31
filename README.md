@@ -1,7 +1,7 @@
 
 # PrismTrade - Аналитическая платформа для прогнозирования цен акций
 
-![PrismTrade Logo](static/stock_prediction.png)
+![PrismTrade Logo](https://github.com/Solrikk/PrismTrade---MOEX/blob/main/static/analytics/stock_prediction.png)
 
 ## Описание проекта
 
